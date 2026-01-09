@@ -95,7 +95,7 @@
 
           # FR/EN: Force Flannel à utiliser l'interface de l'IP privée.
           flannel-iface: "{{ master_private_iface.stdout | default('') }}"
-          notify: Restart k3s
+
 
     - name: Check if k3s is active
       ansible.builtin.command: systemctl is-active k3s
