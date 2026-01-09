@@ -1,0 +1,46 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security
+# FR: Namespace dédié à la sécurité (PKI, secrets sensibles, policies).
+# EN: Dedicated security namespace (PKI, sensitive secrets, policies).
+
+---
+# FR: Issuer "selfSigned" (namespaced) : génère une CA root auto-signée.
+# EN: Namespaced selfSigned Issuer: generates a self-signed root CA.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pki-selfsigned-root
+  namespace: security
+spec:
+  selfSigned: {}
+
+---
+# FR: Certificat de CA root (isCA=true) stocké dans un Secret du namespace security.
+# EN: Root CA certificate (isCA=true) stored as a Secret in the security namespace.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pki-root-ca
+  namespace: security
+spec:
+  isCA: true
+  commonName: pki-root-ca
+  secretName: pki-root-ca-secret
+  issuerRef:
+    name: pki-selfsigned-root
+    kind: Issuer
+
+---
+# FR: Issuer CA (namespaced) qui signe les certificats applicatifs via la CA stockée en Secret.
+# EN: Namespaced CA Issuer that signs application certificates using the CA stored in a Secret.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pki-ca-issuer
+  namespace: security
+spec:
+  ca:
+    secretName: pki-root-ca-secret

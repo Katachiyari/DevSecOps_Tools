@@ -1,0 +1,111 @@
+# Étape 6 — Ingress Traefik + HTTPS (PKI interne)
+#
+# Objectif:
+# - Déployer Traefik via le contrôleur Helm de K3s (HelmChart CRD)
+# - Publier une appli de test dans le namespace `security`
+# - Servir HTTPS avec un certificat signé par l'Issuer `pki-ca-issuer` (namespaced)
+#
+# Remarque:
+# - Pas de ClusterIssuer: tout reste namespaced (Issuer/Certificate/Secret dans `security`).
+
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  repo: https://traefik.github.io/charts
+  chart: traefik
+  targetNamespace: kube-system
+  timeout: 600s
+  valuesContent: |
+    ingressClass:
+      enabled: true
+      isDefaultClass: false
+      name: traefik
+
+    service:
+      type: LoadBalancer
+
+    ports:
+      web:
+        port: 80
+      websecure:
+        port: 443
+        tls:
+          enabled: true
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whoami
+  template:
+    metadata:
+      labels:
+        app: whoami
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10.1
+          ports:
+            - containerPort: 80
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: security
+spec:
+  selector:
+    app: whoami
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: whoami-tls
+  namespace: security
+spec:
+  secretName: whoami-tls
+  issuerRef:
+    name: pki-ca-issuer
+    kind: Issuer
+  dnsNames:
+    - test.entreprise.local
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: whoami
+  namespace: security
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - test.entreprise.local
+      secretName: whoami-tls
+  rules:
+    - host: test.entreprise.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: whoami
+                port:
+                  number: 80

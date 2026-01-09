@@ -84,3 +84,39 @@ But :
 La commande :
 ```bash
 kubectl -n kube-system get pods | egrep -i 'traefik|helm|svclb'
+La commande ne retourne rien → cohérent avec l’objectif.
+
+---
+
+## 7) Pré-requis OS : pourquoi swap=OFF et sysctl=1
+
+Kubernetes/K3s attend un système qui route correctement le trafic réseau inter-pods :
+
+- `net.ipv4.ip_forward=1` (forwarding = routage IP)
+- `net.bridge.bridge-nf-call-iptables=1` (iptables = filtrage/règles réseau)
+- swap désactivé (swap = RAM sur disque, peut perturber les garanties de ressources) [web:82]
+
+Ces réglages augmentent la stabilité du cluster.
+
+---
+
+## 8) Résumé : ce qui est acquis à la fin de l’Étape 4
+
+- Un cluster K3s HA fonctionnel :
+  - 3 masters (control plane + etcd)
+  - 1 worker
+- Un DNS interne opérationnel (CoreDNS).
+- Un réseau pods fonctionnel (IP pods en 10.42.0.x).
+- Un stockage simple disponible (local-path provisioner).
+- Une base de métriques disponible (metrics-server).
+- Ingress non installé volontairement (Traefik packagé désactivé). [web:104][web:265]
+
+---
+
+## 9) Prochaine étape (Étape 5)
+
+Mettre en place l’accès HTTP/HTTPS aux applications :
+
+- Traefik (Ingress controller)
+- cert-manager (certificats TLS)
+- Une application “hello world” exposée en HTTPS
