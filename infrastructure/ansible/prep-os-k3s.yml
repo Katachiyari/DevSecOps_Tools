@@ -1,0 +1,115 @@
+---
+# FR: Objectif : Préparer l'OS (Ubuntu) pour une installation K3s.
+# FR: Effet   : Désactive le swap, charge des modules noyau, applique sysctl, installe paquets de base.
+# FR: Entrées : Inventaire Ansible + accès sudo.
+# FR: Sorties : Nœuds prêts pour l'installation K3s (étape suivante).
+# EN: Goal    : Prepare the OS (Ubuntu) for a K3s installation.
+# EN: Effect  : Disable swap, load kernel modules, apply sysctl, install base packages.
+# EN: Inputs  : Ansible inventory + sudo access.
+# EN: Outputs : Nodes ready for K3s installation (next step).
+
+- name: Prep OS for K3s
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # FR: Paquets minimaux pour scripts réseau/diagnostic.
+    # EN: Minimal packages for networking/diagnostics.
+    base_packages:
+      - curl
+      - ca-certificates
+      - apt-transport-https
+      - gnupg
+      - lsb-release
+      - jq
+
+    # FR: Modules noyau fréquemment requis pour le réseau Kubernetes.
+    # EN: Kernel modules commonly required for Kubernetes networking.
+    k8s_kernel_modules:
+      - br_netfilter
+      - overlay
+
+    # FR: Paramètres sysctl recommandés (réseau / forwarding).
+    # EN: Recommended sysctl settings (network / forwarding).
+    k8s_sysctl:
+      net.ipv4.ip_forward: "1"
+      net.bridge.bridge-nf-call-iptables: "1"
+      net.bridge.bridge-nf-call-ip6tables: "1"
+
+  tasks:
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: "{{ base_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+      failed_when: false
+      # FR: swapoff peut retourner un code non-zéro si aucun swap n'est actif.
+      # EN: swapoff may return non-zero if no swap is active.
+
+    - name: Disable swap persistently in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\\s+swap\\s+.*)$'
+        replace: '# \\1'
+      # FR: Commente toute ligne "swap" non commentée.
+      # EN: Comments out any non-commented swap line.
+
+    - name: Ensure kernel modules config file exists
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: ""
+        force: false
+      # FR: Ne remplace pas si le fichier existe déjà.
+      # EN: Do not overwrite if file already exists.
+
+    - name: Configure required kernel modules
+      ansible.builtin.lineinfile:
+        path: /etc/modules-load.d/k8s.conf
+        line: "{{ item }}"
+        create: true
+        state: present
+      loop: "{{ k8s_kernel_modules }}"
+
+    - name: Load kernel modules now
+      ansible.builtin.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ k8s_kernel_modules }}"
+      failed_when: false
+      # FR: Certains environnements peuvent déjà avoir les modules chargés.
+      # EN: Some environments may already have modules loaded.
+
+    - name: Configure sysctl for Kubernetes networking
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-k8s.conf
+        content: |
+          # FR: Paramètres réseau pour Kubernetes/K3s.
+          # EN: Network settings for Kubernetes/K3s.
+          {% for k, v in k8s_sysctl.items() -%}
+          {{ k }} = {{ v }}
+          {% endfor %}
+        mode: "0644"
+
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+      # FR: Applique /etc/sysctl.d/* de manière globale.
+      # EN: Applies /etc/sysctl.d/* globally.
+
+    - name: Verify swap is disabled
+      ansible.builtin.command: swapon --show
+      register: swapon_show
+      changed_when: false
+
+    - name: Fail if swap is still enabled
+      ansible.builtin.fail:
+        msg: "Swap is still enabled. Check /etc/fstab and disable swap."
+      when: swapon_show.stdout | length > 0
+      # FR: Stoppe le run si swap actif (contrôle qualité).
+      # EN: Stops the run if swap is enabled (quality gate).

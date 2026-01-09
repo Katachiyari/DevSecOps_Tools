@@ -1,0 +1,22 @@
+# infrastructure/ansible/inventory.yml
+all:
+  vars:
+    ansible_user: ubuntu  # user
+    ansible_ssh_private_key_file: ~/.ssh/id_rsa
+    k3s_version: v1.28.10+k3s1  # Version stable LTS
+
+masters:
+  hosts:
+    master1:
+      ansible_host: 192.168.56.101  
+    master2:
+      ansible_host: 192.168.56.102
+    master3:
+      ansible_host: 192.168.56.103
+  vars:
+    node_taints: ["ControlPlane=true:NoSchedule"]
+
+workers:
+  hosts:
+    worker1:
+      ansible_host: 192.168.56.104

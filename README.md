@@ -15,3 +15,12 @@ Plateforme auto-hébergée pour 20-30 ingénieurs.
 ## Démarrer
 ```bash
 make help
+
+## Conventions (FR/EN)
+
+- Tout fichier d'automatisation (Vagrantfile, Ansible, scripts) doit être commenté en **FR + EN**.
+- Commentaires :
+  - Impersonnels (aucun “je/nous”).
+  - Techniques et synthétiques (objectif, prérequis, effet).
+- Toute étape validée doit mettre à jour la documentation dans `docs/guides/`.
+- Les images conteneurs devront utiliser **Docker Hardened Images (DHI)** comme bases lorsque des Dockerfiles seront introduits. [page:0]

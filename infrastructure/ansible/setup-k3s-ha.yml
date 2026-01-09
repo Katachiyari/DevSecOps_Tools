@@ -1,17 +1,25 @@
 ---
 # FR: Objectif : Installer K3s en haute disponibilité (HA) sur 3 masters + 1 worker.
 # FR: Effet   : master1 initialise le cluster (--cluster-init), master2/master3 rejoignent, worker1 rejoint en agent.
-# FR: Entrées : inventory_vagrant.ini + accès sudo.
+# FR: Entrées : inventory_vagrant.ini + accès sudo + fichier k3s-server-config.yaml (dans ansible/files).
 # FR: Sorties : Cluster K3s opérationnel, vérifiable via kubectl sur master1.
 # EN: Goal    : Install K3s in High Availability (HA) on 3 masters + 1 worker.
 # EN: Effect  : master1 bootstraps (--cluster-init), master2/master3 join, worker1 joins as agent.
-# EN: Inputs  : inventory_vagrant.ini + sudo access.
+# EN: Inputs  : inventory_vagrant.ini + sudo access + k3s-server-config.yaml (in ansible/files).
 # EN: Outputs : Working K3s cluster, verifiable via kubectl on master1.
 
 - name: Install K3s servers (HA control plane)
   hosts: masters
   become: true
   gather_facts: true
+  serial: 1
+
+  handlers:
+    - name: Restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+        daemon_reload: true
 
   vars:
     # FR: Version K3s figée (pinned = verrouillée) pour reproductibilité.
@@ -28,24 +36,87 @@
     # FR/EN: Premier master (bootstrap).
     first_master: "{{ groups['masters'][0] }}"
 
+    # FR: IP privées stables (private_network) utilisées pour la communication inter-nœuds.
+    # EN: Stable private IPs (private_network) used for inter-node communication.
+    masters_map:
+      master1: "192.168.56.101"
+      master2: "192.168.56.102"
+      master3: "192.168.56.103"
+
+    # FR: Mettre à true pour réinitialiser (désinstaller) K3s sur les masters avant réinstallation.
+    # EN: Set to true to reset (uninstall) K3s on masters before reinstall.
+    k3s_force_reset: false
+
   tasks:
+    - name: Reset K3s on masters (optional)
+      ansible.builtin.shell: |
+        if [ -x /usr/local/bin/k3s-uninstall.sh ]; then
+          /usr/local/bin/k3s-uninstall.sh
+        fi
+      register: reset_result
+      changed_when: reset_result.rc == 0
+      failed_when: false
+      when: k3s_force_reset | bool
+
+    - name: Ensure /etc/hosts contains masters
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ masters_map[item] }} {{ item }}"
+        state: present
+      loop: "{{ groups['masters'] }}"
+
     - name: Ensure K3s config directory exists
       ansible.builtin.file:
         path: "{{ k3s_config_dir }}"
         state: directory
         mode: "0755"
 
+    - name: Detect private interface for flannel (Vagrant private_network)
+      ansible.builtin.shell: |
+        ip -o -4 addr show | grep -F "{{ masters_map[inventory_hostname] }}/" | awk '{print $2; exit}'
+      register: master_private_iface
+      changed_when: false
+      failed_when: false
+
     - name: Deploy K3s server config file
       ansible.builtin.copy:
-        src: "infrastructure/k3s/k3s-server-config.yaml"
         dest: "{{ k3s_config_file }}"
         mode: "0644"
+        content: |
+          write-kubeconfig-mode: "0644"
+
+          disable:
+            - traefik
+
+          # FR: IMPORTANT (Vagrant) — forcer l'IP privée (évite le NAT 10.0.2.15 identique sur toutes les VM).
+          # EN: IMPORTANT (Vagrant) — force private IP (avoids NAT 10.0.2.15 shared across VMs).
+          node-ip: "{{ masters_map[inventory_hostname] }}"
+          advertise-address: "{{ masters_map[inventory_hostname] }}"
+
+          # FR/EN: Force Flannel à utiliser l'interface de l'IP privée.
+          flannel-iface: "{{ master_private_iface.stdout | default('') }}"
+          notify: Restart k3s
+
+    - name: Check if k3s is active
+      ansible.builtin.command: systemctl is-active k3s
+      register: k3s_is_active
+      changed_when: false
+      failed_when: false
 
     - name: Bootstrap first server (cluster-init)
       ansible.builtin.shell: |
         curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" sh -s - server --cluster-init
-      args:
-        creates: /etc/systemd/system/k3s.service
+      register: bootstrap_result
+      changed_when: bootstrap_result.rc == 0
+      when:
+        - inventory_hostname == first_master
+        - k3s_is_active.stdout not in ['active', 'activating']
+
+    - name: Wait for API server on first master
+      ansible.builtin.wait_for:
+        host: "{{ masters_map[first_master] | default(first_master) }}"
+        port: 6443
+        timeout: 180
       when: inventory_hostname == first_master
 
     - name: Read node-token from first server
@@ -60,27 +131,143 @@
         k3s_token: "{{ token_b64.content | b64decode | trim }}"
       run_once: true
 
+    - name: Wait for API server before joining (from joining nodes)
+      ansible.builtin.wait_for:
+        host: "{{ masters_map[first_master] | default(first_master) }}"
+        port: 6443
+        timeout: 180
+      when:
+        - inventory_hostname != first_master
+        - k3s_is_active.stdout != 'active'
+
+    - name: Wait for k3s to finish starting (when activating)
+      block:
+        - name: Wait for k3s to become active
+          ansible.builtin.command: systemctl is-active k3s
+          register: activating_check
+          changed_when: false
+          until: activating_check.stdout == 'active'
+          retries: 24
+          delay: 5
+      rescue:
+        - name: Collect k3s service status
+          ansible.builtin.command: systemctl status k3s --no-pager -l
+          register: k3s_status
+          changed_when: false
+          failed_when: false
+
+        - name: Collect k3s journal
+          ansible.builtin.command: journalctl -u k3s --no-pager -n 200
+          register: k3s_journal
+          changed_when: false
+          failed_when: false
+
+        - name: Fail with k3s logs
+          ansible.builtin.fail:
+            msg: |
+              k3s reste bloqué en "activating" sur {{ inventory_hostname }}.
+              --- systemctl status k3s ---
+              {{ k3s_status.stdout | default('') }}
+              {{ k3s_status.stderr | default('') }}
+              --- journalctl -u k3s ---
+              {{ k3s_journal.stdout | default('') }}
+              {{ k3s_journal.stderr | default('') }}
+      when:
+        - inventory_hostname != first_master
+        - k3s_is_active.stdout == 'activating'
+
     - name: Join additional servers
-      ansible.builtin.shell: |
-        curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" \
-          K3S_URL="https://{{ hostvars[first_master].ansible_host }}:6443" \
-          K3S_TOKEN="{{ k3s_token }}" \
-          sh -s - server
-      args:
-        creates: /etc/systemd/system/k3s.service
-      when: inventory_hostname != first_master
+      block:
+        - name: Install and join server
+          ansible.builtin.shell: |
+            set -o pipefail
+            curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" \
+              K3S_URL="https://{{ first_master }}:6443" \
+              K3S_TOKEN="{{ k3s_token }}" \
+              sh -s - server
+          args:
+            executable: /bin/bash
+          register: join_result
+          changed_when: join_result.rc == 0
+
+        - name: Wait for k3s to become active
+          ansible.builtin.command: systemctl is-active k3s
+          register: join_active_check
+          changed_when: false
+          until: join_active_check.stdout == 'active'
+          retries: 24
+          delay: 5
+      rescue:
+        - name: Collect k3s service status
+          ansible.builtin.command: systemctl status k3s --no-pager -l
+          register: k3s_status
+          changed_when: false
+          failed_when: false
+
+        - name: Collect k3s journal
+          ansible.builtin.command: journalctl -u k3s --no-pager -n 200
+          register: k3s_journal
+          changed_when: false
+          failed_when: false
+
+        - name: Fail with k3s logs
+          ansible.builtin.fail:
+            msg: |
+              Echec du join K3s sur {{ inventory_hostname }}.
+              --- systemctl status k3s ---
+              {{ k3s_status.stdout | default('') }}
+              {{ k3s_status.stderr | default('') }}
+              --- journalctl -u k3s ---
+              {{ k3s_journal.stdout | default('') }}
+              {{ k3s_journal.stderr | default('') }}
+      when:
+        - inventory_hostname != first_master
+        - k3s_is_active.stdout not in ['active', 'activating']
 
 - name: Install K3s agent (worker)
   hosts: workers
   become: true
   gather_facts: true
 
+  handlers:
+    - name: Restart k3s-agent
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: restarted
+        daemon_reload: true
+
   vars:
     k3s_version: "v1.30.6+k3s1"
     k3s_install_script_url: "https://get.k3s.io"
     first_master: "{{ groups['masters'][0] }}"
 
+    # FR: Mettre à true pour réinitialiser (désinstaller) l'agent K3s sur les workers avant réinstallation.
+    # EN: Set to true to reset (uninstall) K3s agent on workers before reinstall.
+    k3s_force_reset: false
+
+    masters_map:
+      master1: "192.168.56.101"
+      master2: "192.168.56.102"
+      master3: "192.168.56.103"
+
   tasks:
+    - name: Reset K3s agent on workers (optional)
+      ansible.builtin.shell: |
+        if [ -x /usr/local/bin/k3s-agent-uninstall.sh ]; then
+          /usr/local/bin/k3s-agent-uninstall.sh
+        fi
+      register: reset_agent_result
+      changed_when: reset_agent_result.rc == 0
+      failed_when: false
+      when: k3s_force_reset | bool
+
+    - name: Ensure /etc/hosts contains masters
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ masters_map[item] }} {{ item }}"
+        state: present
+      loop: "{{ groups['masters'] }}"
+
     - name: Read node-token from first server
       ansible.builtin.slurp:
         src: /var/lib/rancher/k3s/server/node-token
@@ -93,11 +280,69 @@
         k3s_token: "{{ token_b64.content | b64decode | trim }}"
       run_once: true
 
-    - name: Join worker node
+    - name: Detect worker private IP (prefer 192.168.56.x)
       ansible.builtin.shell: |
-        curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" \
-          K3S_URL="https://{{ hostvars[first_master].ansible_host }}:6443" \
-          K3S_TOKEN="{{ k3s_token }}" \
-          sh -s - agent
+        ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -m1 '^192\.168\.56\.' || true
+      register: worker_private_ip_detect
+      changed_when: false
+      failed_when: false
+
+    - name: Set worker private IP fact
+      ansible.builtin.set_fact:
+        worker_private_ip: "{{ (worker_private_ip_detect.stdout | trim) | default(ansible_default_ipv4.address) }}"
+
+    - name: Detect private interface for flannel (worker)
+      ansible.builtin.shell: |
+        ip -o -4 addr show | grep -F "{{ worker_private_ip }}/" | awk '{print $2; exit}'
+      register: worker_private_iface
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure K3s config directory exists (agent)
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy K3s agent config file
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server: https://{{ first_master }}:6443
+          token: "{{ k3s_token }}"
+          node-ip: "{{ worker_private_ip }}"
+          flannel-iface: "{{ worker_private_iface.stdout | default('') }}"
+      notify: Restart k3s-agent
+
+    - name: Install and join worker node
+      ansible.builtin.shell: |
+        set -o pipefail
+        curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" sh -s - agent
       args:
         creates: /etc/systemd/system/k3s-agent.service
+        executable: /bin/bash
+      async: 900
+      poll: 0
+      register: worker_install_job
+
+    - name: Wait for worker install to finish
+      ansible.builtin.async_status:
+        jid: "{{ worker_install_job.ansible_job_id }}"
+      register: worker_install_result
+      until: worker_install_result.finished
+      retries: 180
+      delay: 5
+
+    - name: Wait for k3s-agent to become active
+      ansible.builtin.command: systemctl is-active k3s-agent
+      register: k3s_agent_is_active
+      changed_when: false
+      failed_when: false
+      until: k3s_agent_is_active.stdout == 'active'
+      retries: 60
+      delay: 5
