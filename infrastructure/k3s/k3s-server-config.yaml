@@ -1,0 +1,11 @@
+# FR: Objectif : Configuration K3s serveur (control plane) commune aux 3 masters.
+# FR: Effet   : Rend la configuration stable et reproductible via un fichier.
+# EN: Goal    : Shared K3s server (control plane) configuration for the 3 masters.
+# EN: Effect  : Makes configuration stable and reproducible via a file.
+
+write-kubeconfig-mode: "0644"
+
+# FR: Désactive Traefik packagé (Ingress géré plus tard dans le Sprint 1).
+# EN: Disables bundled Traefik (Ingress handled later in Sprint 1).
+disable:
+  - traefik

@@ -1,0 +1,103 @@
+---
+# FR: Objectif : Installer K3s en haute disponibilité (HA) sur 3 masters + 1 worker.
+# FR: Effet   : master1 initialise le cluster (--cluster-init), master2/master3 rejoignent, worker1 rejoint en agent.
+# FR: Entrées : inventory_vagrant.ini + accès sudo.
+# FR: Sorties : Cluster K3s opérationnel, vérifiable via kubectl sur master1.
+# EN: Goal    : Install K3s in High Availability (HA) on 3 masters + 1 worker.
+# EN: Effect  : master1 bootstraps (--cluster-init), master2/master3 join, worker1 joins as agent.
+# EN: Inputs  : inventory_vagrant.ini + sudo access.
+# EN: Outputs : Working K3s cluster, verifiable via kubectl on master1.
+
+- name: Install K3s servers (HA control plane)
+  hosts: masters
+  become: true
+  gather_facts: true
+
+  vars:
+    # FR: Version K3s figée (pinned = verrouillée) pour reproductibilité.
+    # EN: Pinned K3s version for reproducibility.
+    k3s_version: "v1.30.6+k3s1"
+
+    # FR/EN: Script officiel d'installation.
+    k3s_install_script_url: "https://get.k3s.io"
+
+    # FR/EN: Chemin config K3s sur les VM.
+    k3s_config_dir: "/etc/rancher/k3s"
+    k3s_config_file: "/etc/rancher/k3s/config.yaml"
+
+    # FR/EN: Premier master (bootstrap).
+    first_master: "{{ groups['masters'][0] }}"
+
+  tasks:
+    - name: Ensure K3s config directory exists
+      ansible.builtin.file:
+        path: "{{ k3s_config_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Deploy K3s server config file
+      ansible.builtin.copy:
+        src: "infrastructure/k3s/k3s-server-config.yaml"
+        dest: "{{ k3s_config_file }}"
+        mode: "0644"
+
+    - name: Bootstrap first server (cluster-init)
+      ansible.builtin.shell: |
+        curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" sh -s - server --cluster-init
+      args:
+        creates: /etc/systemd/system/k3s.service
+      when: inventory_hostname == first_master
+
+    - name: Read node-token from first server
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: token_b64
+      delegate_to: "{{ first_master }}"
+      run_once: true
+
+    - name: Set K3S_TOKEN fact
+      ansible.builtin.set_fact:
+        k3s_token: "{{ token_b64.content | b64decode | trim }}"
+      run_once: true
+
+    - name: Join additional servers
+      ansible.builtin.shell: |
+        curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" \
+          K3S_URL="https://{{ hostvars[first_master].ansible_host }}:6443" \
+          K3S_TOKEN="{{ k3s_token }}" \
+          sh -s - server
+      args:
+        creates: /etc/systemd/system/k3s.service
+      when: inventory_hostname != first_master
+
+- name: Install K3s agent (worker)
+  hosts: workers
+  become: true
+  gather_facts: true
+
+  vars:
+    k3s_version: "v1.30.6+k3s1"
+    k3s_install_script_url: "https://get.k3s.io"
+    first_master: "{{ groups['masters'][0] }}"
+
+  tasks:
+    - name: Read node-token from first server
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: token_b64
+      delegate_to: "{{ first_master }}"
+      run_once: true
+
+    - name: Set K3S_TOKEN fact
+      ansible.builtin.set_fact:
+        k3s_token: "{{ token_b64.content | b64decode | trim }}"
+      run_once: true
+
+    - name: Join worker node
+      ansible.builtin.shell: |
+        curl -sfL "{{ k3s_install_script_url }}" | INSTALL_K3S_VERSION="{{ k3s_version }}" \
+          K3S_URL="https://{{ hostvars[first_master].ansible_host }}:6443" \
+          K3S_TOKEN="{{ k3s_token }}" \
+          sh -s - agent
+      args:
+        creates: /etc/systemd/system/k3s-agent.service
